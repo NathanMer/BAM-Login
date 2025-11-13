@@ -1,0 +1,81 @@
+function doPost(e) {
+  try {
+    const body = JSON.parse(e.postData.contents || "{}");
+    const uid  = String(body.uid || "").toUpperCase().trim();
+    const device = body.device || "";
+    const thing  = body.thing  || "";
+    if (!uid) return txt("ERR no uid");
+
+    const ss   = SpreadsheetApp.getActiveSpreadsheet();
+    const log  = ss.getSheetByName("Log");
+    const dir  = ss.getSheetByName("Directory");
+    const now  = new Date();
+    const tz   = "America/Chicago";
+    const pretty = Utilities.formatDate(now, tz, "yyyy-MM-dd HH:mm:ss");
+
+    // toggle in Directory and get action and person
+    const { action, person } = toggleDirectory(dir, uid, pretty);
+
+    // append to Log
+    appendLogRow(log, now, pretty, uid, device, thing, action, person);
+
+    return txt("OK");
+  } catch (err) {
+    return txt("ERR " + err);
+  }
+}
+
+// find or create the UID in Directory, then flip Status and update fields
+function toggleDirectory(dir, uid, pretty) {
+  const data = dir.getDataRange().getValues(); // includes header
+  if (data.length === 0) throw new Error("Directory is missing headers");
+  const header = data[0];
+  const col = indexMap(header, ["UID","Person","Status","LastSeen","Count"]);
+
+  // find row by UID
+  let row = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][col.UID]).toUpperCase() === uid) { row = i + 1; break; }
+  }
+
+  if (row === -1) {
+    // new UID, default to IN on first scan
+    dir.appendRow([uid, "Unknown", "IN", pretty, 1]);
+    return { action: "IN", person: "Unknown" };
+  }
+
+  // read current values
+  const person = String(dir.getRange(row, col.Person + 1).getValue() || "Unknown");
+  const status = String(dir.getRange(row, col.Status + 1).getValue() || "OUT").toUpperCase();
+  const count  = Number(dir.getRange(row, col.Count  + 1).getValue() || 0);
+
+  // toggle and update fields
+  const next = status === "IN" ? "OUT" : "IN";
+  dir.getRange(row, col.Status   + 1).setValue(next);
+  dir.getRange(row, col.LastSeen + 1).setValue(pretty);
+  dir.getRange(row, col.Count    + 1).setValue(count + 1);
+
+  return { action: next, person };
+}
+
+function appendLogRow(log, now, pretty, uid, device, thing, action, person) {
+  const headers = ["Timestamp","FormattedTime","UID","Device","Thing","Action","Person"];
+  if (log.getLastRow() === 0) log.appendRow(headers);
+  log.appendRow([now, pretty, uid, device, thing, action, person]);
+}
+
+// helpers
+function indexMap(header, names) {
+  const map = {};
+  names.forEach(n => {
+    const i = header.indexOf(n);
+    if (i === -1) throw new Error("Missing column " + n);
+    map[n] = i;
+  });
+  return map;
+}
+function txt(s) {
+  return ContentService.createTextOutput(s).setMimeType(ContentService.MimeType.TEXT);
+}
+
+
