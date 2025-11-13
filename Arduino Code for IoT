@@ -1,0 +1,127 @@
+#include <WiFiNINA.h>      // already pulled in by Arduino Cloud, but include explicitly
+#include <WiFiSSLClient.h> // TLS client for HTTPS
+
+// Google Apps Script endpoint from your URL
+const char* GSCRIPT_HOST = "script.google.com";
+const int   GSCRIPT_PORT = 443;
+// Everything after https://script.google.com goes here: https://script.google.com/macros/s/AKfycbzCXjnoMxZ3VKU82SFG452kblFWPYnFy03OUTFNGMTBefzIYxnrMWkKr6IGCUL33-n8FQ/exec
+const char* GSCRIPT_PATH = "/macros/s/AKfycbzCXjnoMxZ3VKU82SFG452kblFWPYnFy03OUTFNGMTBefzIYxnrMWkKr6IGCUL33-n8FQ/exec";
+
+// Optional metadata to log
+const char* DEVICE_NAME = "Nano33IoT";
+const char* THING_NAME  = "RF_ID";
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include "thingProperties.h"
+
+#define SS_PIN 10
+#define RST_PIN 9
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+bool sendToSheets(const String& uid) {
+  WiFiSSLClient client;
+
+  // JSON body sent to Apps Script
+  String body = String("{\"uid\":\"") + uid + "\","
+                + "\"device\":\"" + DEVICE_NAME + "\","
+                + "\"thing\":\""  + THING_NAME  + "\"}";
+
+  // Open TLS connection
+  if (!client.connect(GSCRIPT_HOST, GSCRIPT_PORT)) {
+    if (Serial) Serial.println("Sheets connect failed");
+    return false;
+  }
+
+  // Build HTTP POST request
+  String req;
+  req  = "POST " + String(GSCRIPT_PATH) + " HTTP/1.1\r\n";
+  req += "Host: " + String(GSCRIPT_HOST) + "\r\n";
+  req += "User-Agent: Nano33IoT\r\n";
+  req += "Content-Type: application/json\r\n";
+  req += "Connection: close\r\n";
+  req += "Content-Length: " + String(body.length()) + "\r\n\r\n";
+  req += body;
+
+  client.print(req);
+
+  // Read the first status line so you know it worked
+  unsigned long t0 = millis();
+  String line;
+  while (client.connected() && millis() - t0 < 3000) {
+    if (client.available()) {
+      char c = client.read();
+      if (c == '\n') break;      // end of status line
+      if (c != '\r') line += c;
+    }
+  }
+  if (Serial && line.length()) Serial.println("Sheets response: " + line);
+  client.stop();
+  return true;
+}
+
+void setup() {
+  Serial.begin(9600);
+  delay(1500); 
+
+  // Cloud
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+
+  // RFID
+  SPI.begin();
+  rfid.PCD_Init();
+  rfid.PCD_AntennaOn();
+
+  Serial.println("RC522 ready - present a tag");
+}
+
+void loop() {
+  ArduinoCloud.update();
+
+  // duplicate filter state
+  static String lastUID = "";
+  static unsigned long lastSendAt = 0;
+  const unsigned long DUP_WINDOW_MS = 5000;  // 5 seconds
+
+  // check for a card
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    // build UID
+    String uidString = "";
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      if (rfid.uid.uidByte[i] < 0x10) uidString += "0";
+      uidString += String(rfid.uid.uidByte[i], HEX);
+    }
+    uidString.toUpperCase();
+
+    unsigned long now = millis();
+    bool isNewUID = (uidString != lastUID);
+    bool windowExpired = (now - lastSendAt >= DUP_WINDOW_MS);
+
+    if (isNewUID || windowExpired) {
+      // update Cloud
+      rF_reader = uidString;
+
+      // local print
+      Serial.print("UID: ");
+      Serial.println(uidString);
+
+      // log to Sheets
+      sendToSheets(uidString);
+
+      // remember for duplicate filtering
+      lastUID = uidString;
+      lastSendAt = now;
+    } else {
+      // duplicate within 5 s — ignored
+      // Serial.println("Duplicate ignored");
+    }
+
+    // clean up reader
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    delay(100); // small settle, keep short so ArduinoCloud.update() runs often
+  }
+}
